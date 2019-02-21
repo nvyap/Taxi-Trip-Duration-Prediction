@@ -1,0 +1,333 @@
+---
+title: "R Notebook"
+output: pdf_document
+---
+
+## Load libraries
+```{r}
+library('ggplot2') # visualisation
+library('scales') # visualisation
+library('grid') # visualisation
+library('RColorBrewer') # visualisation
+library('corrplot') # visualisation
+library('alluvial') # visualisation
+library('dplyr') # data manipulation
+library('readr') # input/output
+library('data.table') # data manipulation
+library('tibble') # data wrangling
+library('tidyr') # data wrangling
+library('stringr') # string manipulation
+library('forcats') # factor manipulation
+library('lubridate') # date and time
+library('geosphere') # geospatial locations
+library('leaflet') # maps
+library('leaflet.extras') # maps
+library('maps') # maps
+library('xgboost') # modelling
+library('caret') # modelling
+require("faraway")
+```
+
+```{r}
+train <- as.tibble(fread('./train.csv'))
+test <- as.tibble(fread('./test.csv'))
+```
+
+
+
+
+
+```{r}
+jfk_coord <- tibble(lon = -73.778889, lat = 40.639722)
+
+la_guardia_coord <- tibble(lon = -73.872611, lat = 40.77725)
+
+
+
+pick_coord <- train %>%
+
+  select(pickup_longitude, pickup_latitude)
+
+drop_coord <- train %>%
+
+  select(dropoff_longitude, dropoff_latitude)
+
+train$dist <- distCosine(pick_coord, drop_coord)
+
+train$bearing = bearing(pick_coord, drop_coord)
+
+
+
+train$jfk_dist_pick <- distCosine(pick_coord, jfk_coord)
+
+train$jfk_dist_drop <- distCosine(drop_coord, jfk_coord)
+
+train$lg_dist_pick <- distCosine(pick_coord, la_guardia_coord)
+
+train$lg_dist_drop <- distCosine(drop_coord, la_guardia_coord)
+
+
+
+train <- train %>%
+
+  mutate(speed = dist/trip_duration*3.6,
+
+         date = date(pickup_datetime),
+
+         month = month(pickup_datetime, label = TRUE),
+
+         wday = wday(pickup_datetime, label = TRUE),
+
+         wday = fct_relevel(wday, c("Mon", "Tues", "Wed", "Thurs", "Fri", "Sat", "Sun")),
+
+         hour = hour(pickup_datetime),
+
+         work = (hour %in% seq(8,18)) & (wday %in% c("Mon","Tues","Wed","Thurs","Fri")),
+
+         jfk_trip = (jfk_dist_pick < 2e3) | (jfk_dist_drop < 2e3),
+
+         lg_trip = (lg_dist_pick < 2e3) | (lg_dist_drop < 2e3),
+
+         blizzard = !( (date < ymd("2016-01-22") | (date > ymd("2016-01-29"))) )
+
+         )
+```
+
+
+### Identifying outliers
+We will check to see if there are any outliers and will remove them from our analysis. Let us check to see if there are any extreme trip durations in our training data.
+
+1. Greater than 24 hours
+```{r}
+day_plus_trips <- train %>%
+
+  filter(trip_duration > 24*3600)
+
+day_plus_trips %>% select(pickup_datetime, dropoff_datetime, speed, dist)
+```
+
+The above rows definitely look spurious because the longest distance is 20km and the time it took is more than 24 hours. So, we can definitely discard these data points
+
+2. More than 3 hours
+
+```{r}
+day_trips <- train %>%
+
+  filter(trip_duration < 24*3600 & trip_duration > 3*3600)
+
+summary(day_trips$dist)
+```
+
+There are 2108 data points which have greater than 3 hours of travel time. We exclude them from our analysis because all the trips are within Manhattan and hence more than 3 hours of one way travel time looks questionable.
+
+3. Very high average speeds
+
+```{r}
+short_trips <- train %>%
+
+  filter(speed > 128)
+
+short_trips %>% select(speed, dist)
+```
+
+There are 129 data points which register more than 120 mph. We exclude them from our analysis because these sorts of average speeds cannot possibly be true.
+
+4. Trips with zero distance
+
+```{r}
+zero_dist <- train %>%
+
+  filter(near(dist,0) & trip_duration > 60)
+
+nrow(zero_dist)
+```
+
+We will only include trips with greater than a minute and exclude rest from our analysis because either they are incorrect data or cancellations after embarking which will not take more than a minute. There are 4210 such data points
+
+5. 300 km long distance pickups or drop-offs from airport
+
+```{r}
+long_dist <- train %>%
+
+  filter( (jfk_dist_pick > 300000) | (jfk_dist_drop > 300000) )
+
+nrow(long_dist)
+```
+There are 31 such points. These again seem doubtful and we drop them from our analysis.
+
+
+6. Filtering all these cases from the training set
+```{r}
+train <- train %>%
+
+  filter(trip_duration <= 3*3600,
+
+         dist > 0 | (near(dist, 0) & trip_duration < 60),
+
+         jfk_dist_pick < 300000 & jfk_dist_drop < 300000,
+         
+         trip_duration >10,
+
+         speed < 128)
+```
+
+7. Counting the final cases left 
+```{r}
+length(train$id)
+```
+A total of 1,452,181 records are left in the training set
+
+### Identifying leverage or influential points
+We will check to see if there are any influential points in the predictor space that skew our analysis and we will remove such points from consideration.
+
+1. Build the model
+```{r}
+lmod=lm(trip_duration ~ vendor_id + passenger_count + store_and_fwd_flag + dist + date + month + wday + hour + work + blizzard,data=train)
+```
+
+2. Summarizing the model
+```{r}
+summary(lmod)
+```
+
+3. Checking the leverage points
+```{r}
+hatv <- hatvalues(lmod)
+matrix=matrix(lmod)
+model.matrix(lmod)[14427,]
+halfnorm(hatv, ylab = "Leverages") 
+abline(0,1)
+```
+
+Points id1092161 and id1489236 are points with high leverages
+
+```{r}
+train[c(14427, 129375),]
+
+#hatv[hatv > 0.0005]
+
+#leverage_points <- train %>%
+
+#  filter(id == "id0687776" | id == "id1092161")
+
+#leverage_points %>% select(id, pickup_datetime, dropoff_datetime,  speed, dist)
+
+```
+
+
+```{r}
+stud <- rstudent(lmod) 
+length(stud[abs(stud)>3.525801])
+```
+
+Bonferroni critical value is
+```{r}
+qt(.05/(50*2),44)
+```
+
+
+```{r}
+cook <- cooks.distance(lmod)
+halfnorm(cook, 3, labs=ids, ylab="Cook's distances")
+```
+
+```{r}
+train[c(14427, 129375),]
+length(train$id)
+length(lmod$fitted.values)
+
+```
+
+
+```{r}
+train <- train %>%
+
+  filter(id != 'id1092161' &
+id != 'id1311087' &
+id != 'id0687776' &
+id != 'id1216866' &
+id != 'id3795134')
+```
+
+```{r}
+#lmod=lm((trip_duration)~vendor_id+passenger_count+pickup_longitude+pickup_latitude+dropoff_longitude+dropoff_latitude+store_and_fwd_flag+dist+jfk_dist_pick+jfk_dist_drop+lg_dist_pick+lg_dist_drop+date+month+wday+hour+work+jfk_trip+lg_trip,data=train)
+lmod=lm((trip_duration)~vendor_id+passenger_count+store_and_fwd_flag+dist+date+month+wday+hour+work+blizzard,data=train)
+#qqnorm(residuals(lmod))
+#qqline(residuals(lmod))
+#shapiro.test(residuals(lmod))
+#heteroskedasticity 
+#lmod=lm((trip_duration)~vendor_id+passenger_count+pickup_longitude+pickup_latitude+dropoff_longitude+dropoff_latitude+store_and_fwd_flag+dist+jfk_dist_pick+jfk_dist_drop+lg_dist_pick+lg_dist_drop+date+month+wday+hour+work+jfk_trip+lg_trip,data=train)
+#plot(fitted(lmod),residuals(lmod),xlab="Fitted",ylab="Residuals")
+#abline(h=0)
+```
+
+```{r}
+summary(lmod)
+length(lmod[lmod$fit<0])
+```
+
+```{r}
+boxcox(lmod, plotit=T, lambda=seq(0.3,0.5,by=0.01))
+```
+
+```{r}
+lmod=lm((trip_duration)^0.397~vendor_id + passenger_count + 
+    store_and_fwd_flag + dist + date + month + wday + hour + 
+    work + blizzard,data=train)
+plot(fitted(lmod),residuals(lmod),xlab="Fitted",ylab="Residuals")
+abline(h=0)
+```
+
+```{r}
+summary(lmod)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+
+```{r}
+train %>%
+  ggplot(aes(trip_duration)) +
+  geom_histogram(fill = "#8856a7", bins = 150) +
+  scale_x_log10() +
+  scale_y_sqrt()
+```
+
+```{r}
+trainx <- train[,c("passenger_count", "dist")]
+cor(trainx)
+#corrplot(as.matrix(train), is.corr=FALSE, method="circle")
+#vendor_id+passenger_count+store_and_fwd_flag+dist+date+month+wday+hour+work+blizzard
+```
+
+
+
+```{r}
+lassomod <- lars(as.matrix(train[,c('vendor_id','passenger_count','dist','hour','blizzard','work')]),as.matrix(train$trip_duration^0.397))
+```
+
+```{r}
+plot(lassomod)
+```
+
+```{r}
+summary(lm(trip_duration^0.397 ~ vendor_id + work + dist, train))
+```
+
+
+```{r}
+lmod=lm((trip_duration)^0.397~vendor_id+passenger_count+store_and_fwd_flag+dist+date+month+wday+hour+work+blizzard,data=train)
+```
+
+```{r}
+step(lmod)
+```
+
+
+```{r}
+summary(lm(trip_duration^0.397 ~ vendor_id + work + dist + work:vendor_id + dist:work + vendor_id:dist, train))
+```
